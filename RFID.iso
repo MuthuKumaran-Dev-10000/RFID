@@ -1,0 +1,169 @@
+#include <Arduino.h>
+#if defined(ESP32)
+  #include <WiFi.h>
+#elif defined(ESP8266)
+  #include <ESP8266WiFi.h>
+#endif
+#include <Firebase_ESP_Client.h>
+
+#include <SPI.h>
+#include <MFRC522.h>
+
+#define WIFI_SSID "BlackBox"
+#define WIFI_PASSWORD "DhruvDev001"
+#define API_KEY "AIzaSyDWL-0RYhZaNslZP6z2BK58qx8tG9LiLg0"
+#define DATABASE_URL "https://rfidsample-c13cc-default-rtdb.firebaseio.com/"
+
+constexpr uint8_t RST_PIN = D3;
+constexpr uint8_t SS_PIN = D4;
+
+MFRC522 rfid(SS_PIN, RST_PIN);
+MFRC522::MIFARE_Key key;
+
+struct CardStatus {
+  bool isInside;
+  unsigned long enterTime;
+};
+
+const int MAX_CARDS = 10;
+String cardTags[MAX_CARDS];
+CardStatus cardStatus[MAX_CARDS];
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+unsigned long sendDataPrevMillis = 0;
+int count = 0;
+bool signupOK = false;
+
+void tokenStatusCallback(token_info_t tokenInfo) {
+  Serial.printf("Token Status: %s, Token: \n", tokenInfo.status ? "Success" : "Failed");
+}
+
+void updateDatabase(const String& uid, bool isInside, unsigned long duration) {
+  String entryPath = "RFID/entries/" + uid;
+
+  /* Check if the card is already inside and is presented again
+  if (Firebase.RTDB.getBool(&fbdo, entryPath + "/status") && isInside) {
+    // Remove the card from in-list
+    Firebase.RTDB.setString(&fbdo, "RFID/inlist/" + uid, ""); // Set value to empty string
+    // Add it to out-list
+    Firebase.RTDB.push(&fbdo, "RFID/outlist", uid.c_str());
+  } else if (!isInside) {
+    // Remove the card from out-list
+    Firebase.RTDB.setString(&fbdo, "RFID/outlist/" + uid, ""); // Set value to empty string
+    // Add it to in-list
+    Firebase.RTDB.push(&fbdo, "RFID/inlist", uid.c_str());
+  }*/
+  // Update the duration and current status
+  Firebase.RTDB.setInt(&fbdo, entryPath + "/duration", duration);
+  Firebase.RTDB.setBool(&fbdo, entryPath + "/status", isInside);
+}
+
+
+void setup() {
+  
+  
+  Serial.begin(115200);
+  Serial.println("Connecting to WiFi...");
+  
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+  }
+
+  Serial.println("Connected to WiFi!");
+  Serial.println("Initializing Firebase...");
+
+
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  if (Firebase.signUp(&config, &auth, "", "")) {
+    signupOK = true;
+  }
+
+  config.token_status_callback = tokenStatusCallback;
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  SPI.begin();
+  rfid.PCD_Init();
+}
+
+void loop() {
+  if (Firebase.ready() && signupOK && (millis() - sendDataPrevMillis > 15000 || sendDataPrevMillis == 0)) {
+    sendDataPrevMillis = millis();
+
+    if (Firebase.RTDB.setInt(&fbdo, "test/int", count)) {
+      count++;
+    }
+
+    if (Firebase.RTDB.setFloat(&fbdo, "test/float", 0.01 + random(0, 100))) {
+      // Do something if successful
+    }
+  }
+
+  if (!rfid.PICC_IsNewCardPresent())
+    return;
+
+  if (rfid.PICC_ReadCardSerial()) {
+    String tag;
+    for (byte i = 0; i < 4; i++) {
+      tag += rfid.uid.uidByte[i];
+    }
+
+    int cardIndex = findCard(tag);
+
+    if (cardIndex == -1) {
+      int emptyIndex = findEmptyCardIndex();
+      if (emptyIndex != -1) {
+        cardTags[emptyIndex] = tag;
+        cardStatus[emptyIndex] = {true, millis()};
+        updateDatabase(tag, true, 0);
+      }
+    } else {
+      CardStatus &status = cardStatus[cardIndex];
+      if (status.isInside) {
+        status.isInside = false;
+        unsigned long exitTime = millis();
+        unsigned long duration = exitTime - status.enterTime;
+        updateDatabase(tag, false, duration);
+      } else {
+        status.isInside = true;
+        status.enterTime = millis();
+        updateDatabase(tag, true, 0);
+      }
+    }
+
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+  }
+}
+
+int findCard(String tag) {
+  for (int i = 0; i < MAX_CARDS; i++) {
+    if (cardTags[i] == tag) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+int findEmptyCardIndex() {
+  for (int i = 0; i < MAX_CARDS; i++) {
+    if (cardTags[i] == "") {
+      return i;
+    }
+  }
+  return -1;
+}
+
+String formatDuration(unsigned long duration) {
+  unsigned long seconds = duration / 1000;
+  unsigned long minutes = seconds / 60;
+  seconds = seconds % 60;
+
+  return String(minutes) + "m " + String(seconds) + "s";
+}
